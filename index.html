@@ -380,11 +380,22 @@ $('#demoBar').innerHTML = DEMO ? '<div class="demo">미리보기 모드 — 가�
 function resetDemo(){ try { localStorage.removeItem('sangju_demo_v2'); } catch(e){} ssSet('sangju_pw', null); location.hash = ''; location.reload(); }
 function footer(){ $('#foot').innerHTML = `<button onclick="go('admin')">임원진</button><div>2026 개발 목방 38기 장소현</div>`; }
 
-async function loadPub(){ S.pub = await api('getPublic'); return S.pub; }
+/* 빠르게 보이기: 지난번에 받은 내용을 기기에 저장해 두고 먼저 보여 준 뒤, 서버(1~3초)에서 새로 받아 바꿔 넣어요 */
+const PUB_KEY = DEMO ? 'sangju_pub_demo' : 'sangju_pub';
+async function loadPub(){ S.pub = await api('getPublic'); lsSet(PUB_KEY, S.pub); return S.pub; }
+function refreshPubLater(){ loadPub().then(() => { if (!S.view || S.view === 'table') render(); }).catch(() => {}); }
 async function boot(){
   const v = new URLSearchParams(location.search).get('v');
   if (v && !location.hash){ const m = {f:'form', t:'table', a:'admin'}[v]; if (m) history.replaceState(null, '', location.pathname + location.search + '#' + m); }
   footer();
+  const cached = lsGet(PUB_KEY, null);
+  if (cached && cached.cfg){
+    S.pub = cached; render();
+    const before = JSON.stringify(cached);
+    loadPub().then(p => { if (JSON.stringify(p) !== before && (!S.view || S.view === 'table')) render(); }).catch(() => {});
+    return;
+  }
+  $('#app').innerHTML = `<img class="hero" src="poster-title.jpg" alt="${esc(HERO.hanja + ' ' + HERO.name)}"><p class="muted small">불러오는 중…</p>`;
   try { await loadPub(); } catch(e){ $('#app').innerHTML = `<div class="card"><h2>불러오지 못했어요</h2><p class="muted">${esc(e.message)}</p><button class="btn" onclick="location.reload()">다시 시도</button></div>`; return; }
   render();
 }
@@ -459,15 +470,27 @@ async function formNext(){
   const err = $('#fErr'); err.textContent = '';
   if (!name) return err.textContent = '이름을 적어 주세요';
   if (!/^\d{9}$/.test(sid)) return err.textContent = '학번은 9자리 숫자로 적어 주세요';
-  const b = $('#fNext'); b.disabled = true; b.textContent = '확인하는 중…';
-  try {
-    const mine = await api('getMine', {sid, name});
+  const b = $('#fNext');
+  const done = mine => {
     S.me = {name, sid}; lsSet('sangju_me', S.me);
     $('#fName').disabled = $('#fSid').disabled = true;
     b.outerHTML = `<button class="btn ghost sm" onclick="viewForm()">이름·학번 바꾸기</button>`;
     formStep2(mine);
-  } catch(e){ err.textContent = e.message; b.disabled = false; b.textContent = '다음'; }
+  };
+  // 이 기기에서 낸 적이 있으면 바로 보여 주고, 서버 내용은 뒤에서 확인해요
+  const local = lsGet(MINE_KEY, null);
+  if (local && local.sid === sid && normName(local.name) === normName(name)){
+    done(local);
+    api('getMine', {sid, name}).then(m => {
+      if (!S.formDirty && m && JSON.stringify([...(m.avail || [])].sort()) !== JSON.stringify([...(local.avail || [])].sort())){ lsSet(MINE_KEY, Object.assign({sid, name}, m)); formStep2(m); }
+    }).catch(() => {});
+    return;
+  }
+  b.disabled = true; b.textContent = '확인하는 중…';
+  try { const mine = await api('getMine', {sid, name}); if (mine) lsSet(MINE_KEY, Object.assign({sid, name}, mine)); done(mine); }
+  catch(e){ err.textContent = e.message; b.disabled = false; b.textContent = '다음'; }
 }
+const MINE_KEY = DEMO ? 'sangju_mine_demo' : 'sangju_mine';
 function formStep2(mine){
   const c = S.pub.cfg;
   const sel = new Set((mine && mine.avail) || []);
@@ -486,13 +509,13 @@ function formStep2(mine){
     <div class="err" id="fErr2"></div>
     ${open ? `<button class="btn primary block" id="fSave" onclick="formSave()">${mine ? '고친 내용 저장하기' : '저장하기'}</button>` : ''}
   </div>`;
-  S.formSel = sel;
+  S.formSel = sel; S.formDirty = false;
   const upd = () => {
     const ranges = rangesOf(sel, c.days);
     const tot = [...sel].filter(k => validKeys(c.days).has(k)).length;
     $('#fSum').innerHTML = `고른 시간 <b>${tot}시간</b>` + (ranges.length ? '<br><span class="muted">' + ranges.map(x => esc(fmtDate(x.date)) + ' ' + x.rs.map(r => fmtRange(r[0], r[1])).join(', ')).join('<br>') + '</span>' : '');
   };
-  drawGrid($('#fGrid'), c.days, {mode: open ? 'edit' : 'view', sel, onChange: upd});
+  drawGrid($('#fGrid'), c.days, {mode: open ? 'edit' : 'view', sel, onChange: () => { S.formDirty = true; upd(); }});
   upd();
   $('#fStep2').scrollIntoView({behavior:'smooth', block:'start'});
 }
@@ -502,7 +525,10 @@ async function formSave(){
   if (!avail.length) return err.textContent = '가능한 시간을 한 칸 이상 칠해 주세요';
   const b = $('#fSave'); b.disabled = true; b.textContent = '저장하는 중…';
   try {
-    await api('submit', {sid: S.me.sid, name: S.me.name, avail, memo: $('#fMemo').value.trim()});
+    const memo = $('#fMemo').value.trim();
+    await api('submit', {sid: S.me.sid, name: S.me.name, avail, memo});
+    lsSet(MINE_KEY, {sid: S.me.sid, name: S.me.name, avail, memo});
+    refreshPubLater();
     const set = new Set(avail);
     $('#app').innerHTML = `
     <div class="card">
@@ -638,6 +664,8 @@ async function adminLogin(){
   catch(e){ $('#aErr').textContent = e.message; b.disabled = false; b.textContent = '들어가기'; S.pw = null; ssSet('sangju_pw', null); }
 }
 async function adminReload(){ S.admin = await api('adminGet', {pw: S.pw}); }
+// 새 서버(Code.gs)는 저장하면서 최신 임원진 데이터를 같이 돌려줘서 한 번만 기다리면 돼요. 예전 서버면 한 번 더 받아요.
+async function adminWrite(action, data){ const r = await api(action, Object.assign({pw: S.pw}, data)); if (r && r.cfg && r.responses) S.admin = r; else await adminReload(); }
 function adminMain(){
   const A = S.admin;
   $('#app').innerHTML = `
@@ -736,7 +764,7 @@ async function saveCfg(){
   const bad = c.days.find(d => d.close <= d.open);
   if (bad) return err.textContent = `${fmtDate(bad.date)}: 닫는 시간이 여는 시간보다 늦어야 해요`;
   const b = $('#sSave'); b.disabled = true; b.textContent = '저장하는 중…';
-  try { await api('saveConfig', {pw: S.pw, cfg: c}); await adminReload(); await loadPub(); setTop(); toast('설정을 저장했어요'); tabSet(); }
+  try { await adminWrite('saveConfig', {cfg: c}); S.pub.cfg = Object.assign({}, S.pub.cfg, {title: S.admin.cfg.title, notice: S.admin.cfg.notice, open: S.admin.cfg.open, k: S.admin.cfg.k, days: S.admin.cfg.days}); lsSet(PUB_KEY, S.pub); refreshPubLater(); setTop(); toast('설정을 저장했어요'); tabSet(); }
   catch(e){ err.textContent = e.message; b.disabled = false; b.textContent = '설정 저장하기'; }
 }
 async function changePw(){
@@ -792,7 +820,7 @@ function tabResp(){
   document.querySelectorAll('[data-del]').forEach(b => b.onclick = async () => {
     if (!b.classList.contains('armed')){ b.classList.add('armed'); b.textContent = '지울까요?'; setTimeout(() => { if (b.isConnected){ b.classList.remove('armed'); b.textContent = '삭제'; } }, 4000); return; }
     b.disabled = true;
-    try { await api('deleteResponse', {pw: S.pw, sid: b.dataset.del}); await adminReload(); toast('지웠어요'); adminMain(); } catch(e){ toast(e.message); b.disabled = false; }
+    try { await adminWrite('deleteResponse', {sid: b.dataset.del}); refreshPubLater(); toast('지웠어요'); adminMain(); } catch(e){ toast(e.message); b.disabled = false; }
   });
 }
 
@@ -895,8 +923,8 @@ function drawResult(people, stale, gone){
     const btn = publish ? $('#dPub') : $('#dSave'); const t = btn.textContent; btn.disabled = true; btn.textContent = '저장하는 중…';
     try {
       const out = Object.assign({}, D); delete out.dirty; delete out.saved;
-      await api('saveResult', {pw: S.pw, result: out, publish});
-      await adminReload(); await loadPub();
+      await adminWrite('saveResult', {result: out, publish});
+      refreshPubLater();
       S.draft = JSON.parse(JSON.stringify(S.admin.result)); S.draft.saved = true;
       toast(publish ? '공개했어요. 부원들이 첫 화면에서 볼 수 있어요' : '저장했어요 (아직 비공개)');
       drawResult(people, 0, 0);
@@ -905,7 +933,7 @@ function drawResult(people, stale, gone){
   $('#dPub').onclick = () => save(true);
   $('#dSave').onclick = () => save(false);
   if ($('#dUnpub')) $('#dUnpub').onclick = async () => {
-    try { await api('unpublish', {pw: S.pw}); await adminReload(); await loadPub(); S.draft.saved = true; toast('공개를 내렸어요'); drawResult(people, stale, gone); } catch(e){ toast(e.message); }
+    try { await adminWrite('unpublish', {}); refreshPubLater(); S.draft.saved = true; toast('공개를 내렸어요'); drawResult(people, stale, gone); } catch(e){ toast(e.message); }
   };
   $('#dCopy').onclick = () => copyText(resultText(D), '시간표 공지글을 복사했어요');
 }
@@ -961,10 +989,10 @@ const Mock = {
         Object.assign(r, {name: q.name.trim(), avail, memo: String(q.memo || '').slice(0, 300), updated: Date.now()}); save(); return true;
       }
       case 'adminGet': admin(); return {cfg: db.cfg, responses: db.responses, result: db.result, published: db.published};
-      case 'saveConfig': admin(); db.cfg = q.cfg; save(); return true;
-      case 'deleteResponse': admin(); db.responses = db.responses.filter(r => r.sid !== q.sid); save(); return true;
-      case 'saveResult': admin(); db.result = q.result; db.published = !!q.publish; save(); return true;
-      case 'unpublish': admin(); db.published = false; save(); return true;
+      case 'saveConfig': admin(); db.cfg = q.cfg; save(); return {cfg: db.cfg, responses: db.responses, result: db.result, published: db.published};
+      case 'deleteResponse': admin(); db.responses = db.responses.filter(r => r.sid !== q.sid); save(); return {cfg: db.cfg, responses: db.responses, result: db.result, published: db.published};
+      case 'saveResult': admin(); db.result = q.result; db.published = !!q.publish; save(); return {cfg: db.cfg, responses: db.responses, result: db.result, published: db.published};
+      case 'unpublish': admin(); db.published = false; save(); return {cfg: db.cfg, responses: db.responses, result: db.result, published: db.published};
       case 'changePw': admin(); db.pw = q.newPw; save(); return true;
     }
     throw new Error('알 수 없는 요청');
